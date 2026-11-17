@@ -106,6 +106,19 @@ def downloaded_code_runs(cmd):
     return bool(re.search(r"(curl|wget)\b", rest) and
                 re.search(r"\|\s*(sudo\s+)?((ba|z|da)?sh|python3?|node|perl|ruby)\b", rest))
 
+# 승인창 없이 자동 차단하는 '확실한 악성' (RUNTIME 설명 문구 기준)
+DENY_DESCS = {
+    "다운로드한 코드를 바로 실행",
+    "SSH 키 폴더 접근",
+    "키체인(비밀번호 저장소) 접근",
+    "브라우저 쿠키·비밀번호 접근",
+    "클라우드·GitHub 자격증명 접근",
+    "외부 수집·업로드 주소로 전송",
+    "리버스 셸",
+    "권한 확인 우회",
+}
+BASELINE_CHANGE = re.compile(r"skill-security-vetting/hooks/guard\.py\s+(accept|baseline-init)")
+
 EXEMPT_WRITE = {
     os.path.join(SK, "installed-log.md"),
 }
@@ -119,11 +132,18 @@ def pretool():
     tool = data.get("tool_name", "")
     ti = data.get("tool_input") or {}
 
+    # 오토 모드에서도 끊기지 않게: 승인창(ask)은 기준선 변경 하나만 남기고,
+    # 확실한 악성은 자동 차단(deny), 나머지는 기록만(note) — 스킬·설정 변경은 SessionStart 무결성 검사가 다시 잡는다.
     def decide(kind, reason):
         log(f"{kind} {tool}: {reason}")
+        if kind == "deny":
+            reason += " (꼭 필요하면 사용자가 직접 `! 명령`으로 실행하세요)"
         out({"hookSpecificOutput": {"hookEventName": "PreToolUse",
                                     "permissionDecision": kind,
                                     "permissionDecisionReason": "[스킬 보안 감시] " + reason}})
+
+    def note(reason):
+        log(f"note {tool}: {reason}")
 
     if tool in ("Write", "Edit", "MultiEdit", "NotebookEdit"):
         p = ti.get("file_path") or ti.get("notebook_path") or ""
@@ -133,7 +153,7 @@ def pretool():
         cwd = data.get("cwd") or os.getcwd()
         full = rp if os.path.isabs(p) else os.path.realpath(os.path.join(cwd, p))
         if PROT_PATH.search(full.replace(HOME, "~")) or PROT_PATH.search(full):
-            decide("ask", f"스킬·플러그인·훅·MCP 설정 파일 수정: {full.replace(HOME, '~')} — 외부 스킬 내용을 옮겨 적는 거라면 먼저 skill-security-vetting 점검을 거쳐야 합니다.")
+            note(f"스킬·플러그인·훅·MCP 설정 파일 수정: {full.replace(HOME, '~')}")
         return
 
     if tool != "Bash":
@@ -144,20 +164,38 @@ def pretool():
     # 실제로 실행되는 부분만: heredoc 본문·따옴표 안 문자열을 걷어낸 명령
     bare = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?.*?\n.*?\n\1\b", "<<HEREDOC", cmd, flags=re.S)
     bare = re.sub(r"'[^']*'|\"(\\.|[^\"\\])*\"", "''", bare)
-    if touches and FETCH_VERB.search(cmd) and not (PROT_PATH.search(bare) and FETCH_VERB.search(bare)):
-        decide("ask", "명령 안 글자(따옴표·입력 본문)에 다운로드 명령과 스킬·설정 경로가 함께 있습니다. 문서·설정 편집이라면 승인, 외부 코드 설치라면 거부하세요.")
+
+    # 입력 본문(heredoc)은 받는 쪽이 셸(sh·bash·zsh)일 때만 실행되는 코드로 본다. cat·python3·tee 등에 넘기는 본문은 데이터.
+    def _strip_data_heredoc(m):
+        before = cmd[:m.start()].rsplit("\n", 1)[-1]
+        return m.group(0) if re.search(r"\b(ba|z|da)?sh\s*(-s\s*)?$", before.strip()) else "<<HEREDOC"
+    nohd = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?.*?\n.*?\n\1\b", _strip_data_heredoc, cmd, flags=re.S)
+
+    # 1) 승인창: 감시 기준선 변경만 (악성 스킬이 Claude를 속여 스스로 승인하는 것 방지, 드물게만 뜸)
+    if BASELINE_CHANGE.search(cmd):
+        decide("ask", "감시 기준선 변경입니다. 바뀐 스킬·설정을 확인하셨다면 승인하세요.")
+    # 2) 자동 차단: 확실한 악성
     if touches and FETCH_VERB.search(bare):
-        decide("deny", "외부 코드를 스킬·플러그인·설정 폴더에 직접 받으려고 합니다. skill-security-vetting 절차(격리 폴더에 받기 → 점검 → 승인 → install_verified.py)로 진행하세요.")
-    if touches and "install_verified.py" in cmd:
-        decide("ask", "점검을 통과한 사본을 스킬 폴더에 설치합니다. 점검 보고를 보셨다면 승인하세요.")
-    if touches and WRITE_VERB.search(cmd):
-        decide("ask", "스킬·플러그인·훅·MCP 설정 폴더를 바꾸는 명령입니다. 외부에서 받은 내용이면 먼저 점검이 필요합니다.")
-    if INSTALL_CMD.search(cmd):
-        decide("ask", "플러그인·스킬·MCP 서버 설치 명령입니다. 설치 전에 skill-security-vetting으로 출처와 코드를 점검했는지 확인하세요.")
+        decide("deny", "외부 코드를 스킬·플러그인·설정 폴더에 직접 받으려고 합니다. 격리 폴더에 받기 → 점검 → install_verified.py 절차로 진행하세요.")
     for i, (rx, desc) in enumerate(RUNTIME):
-        hit = downloaded_code_runs(cmd) if i == 0 else rx.search(cmd)
+        if desc not in DENY_DESCS:
+            continue
+        if i == 0:
+            hit = downloaded_code_runs(nohd)
+        elif desc == "권한 확인 우회":
+            hit = rx.search(bare)  # 설정 파일을 grep하는 것처럼 따옴표 안 글자는 제외
+        else:
+            hit = rx.search(nohd)
         if hit:
-            decide("ask", f"위험할 수 있는 명령: {desc}")
+            decide("deny", f"위험한 명령이라 막았습니다: {desc}")
+    # 3) 기록만: 스킬·설정 폴더 쓰기, 설치, 자동 실행 등록 등 (다음 세션 시작 때 무결성 검사가 확인)
+    if touches and (WRITE_VERB.search(cmd) or "install_verified.py" in cmd or FETCH_VERB.search(cmd)):
+        note("스킬·플러그인·훅·MCP 설정 폴더를 바꾸는 명령")
+    if INSTALL_CMD.search(cmd):
+        note("플러그인·스킬·MCP 서버 설치 명령")
+    for rx, desc in RUNTIME[1:]:
+        if desc not in DENY_DESCS and rx.search(cmd):
+            note(f"주의 명령: {desc}")
 
 
 # ------------------------------------------------------------------ SessionStart (무결성)

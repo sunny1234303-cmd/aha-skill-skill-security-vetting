@@ -166,14 +166,14 @@ python3 -I "$SK/scripts/install_verified.py" "$V/src/<스킬폴더>" "$V/scan.js
 ## 자동 감시 (훅, 위 설치 절차로 `~/.claude/settings.json`에 등록)
 
 `hooks/guard.py` 두 겹:
-1. **PreToolUse (실시간)** — Bash·Write·Edit 직전 검사
-   - 스킬·플러그인·에이전트·커맨드·훅·settings·`.mcp.json`·`~/.claude.json` 경로에 **외부에서 바로 받기**(git clone·curl·wget·unzip·tar x) → **차단**
-   - 같은 경로에 쓰기·복사·삭제, `install_verified.py` 설치, `claude plugin install`·`claude mcp add`·`npx … mcp` → **승인창**
-   - 어디서든 위험 명령(curl|sh, ~/.ssh·키체인·브라우저 쿠키·클라우드 키, LaunchAgents·crontab·셸 rc 수정, 웹훅·익명 업로드, 리버스 셸, 권한 우회, Gatekeeper 해제, 화면·키 입력 조작, 감시 기준선 변경) → **승인창**
-   - `launchctl list`·`crontab -l`·읽기 명령, `curl … | python3 -c "JSON 읽기"`(인라인 코드에 exec·eval 등이 없을 때)는 통과
+1. **PreToolUse (실시간)** — Bash·Write·Edit 직전 검사. **오토 모드를 끊지 않도록 승인창은 기준선 변경 하나뿐**이다.
+   - **자동 차단**(확실한 악성): 스킬·플러그인·에이전트·커맨드·훅·settings·`.mcp.json`·`~/.claude.json` 경로에 외부에서 바로 받기(git clone·curl·wget·unzip·tar x) · 다운로드한 코드를 바로 실행(curl|sh, curl|python 등) · `~/.ssh`·키체인·브라우저 쿠키·클라우드/GitHub 자격증명 접근 · 웹훅·익명 업로드 주소로 전송 · 리버스 셸 · 권한 확인 우회. 차단된 작업이 꼭 필요하면 사용자가 직접 `! 명령`으로 실행한다.
+   - **승인창**: 감시 기준선 변경(`guard.py accept`·`baseline-init`)만 — 악성 스킬이 Claude를 속여 스스로 승인하는 것을 막기 위해. 드물게만 뜬다.
+   - **기록만**(막지 않음, `state/guard-log.txt`에 `note`): 같은 경로에 쓰기·복사·삭제, `install_verified.py` 설치, `claude plugin install`·`claude mcp add`·`npx … mcp`, LaunchAgents·crontab·셸 rc 수정, Gatekeeper 해제, 화면·키 입력 조작. 스킬·설정 변경은 다음 세션 시작 때 2번 검사가 다시 잡는다.
+   - `curl … | python3 -c "JSON 읽기"`(인라인 코드에 exec·eval 등이 없을 때)는 실행이 아니라 읽기로 보고 통과. 설정 파일을 grep하는 것처럼 따옴표 안 글자는 '권한 우회'로 보지 않는다.
 2. **SessionStart (세션 시작마다)** — 기준선(`state/baseline.json`, 파일별 SHA-256)과 비교해 새로 생기거나 바뀐 스킬·synced 스킬·플러그인 캐시·마켓플레이스·에이전트·커맨드·**훅/권한/MCP 설정**을 알리고, 바뀐 폴더는 자동 스캔(최대 15초). 터미널에서 직접 복사한 것, 플러그인·claude.ai 동기화 자동 업데이트, 누가 훅을 몰래 추가한 것까지 잡는다.
 
-알림이 오면: 사용자에게 목록을 먼저 보여주고 → 4단계(직접 읽기)로 확인 → 승인받으면 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py accept <키>` (이 명령은 항상 승인창). 현재 차이만 보기: `guard.py status`. 로그: `state/guard-log.txt`.
+알림이 오면: 사용자에게 목록을 먼저 보여주고 → 4단계(직접 읽기)로 확인 → 승인받으면 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py accept <키>` (실시간 감시에서 승인창이 뜨는 유일한 명령). 현재 차이만 보기: `guard.py status`. 로그: `state/guard-log.txt`.
 
 **알려진 한계 (정직하게):** 파이썬 스크립트 *안에서* 파일을 쓰는 경우처럼 명령 문자열에 드러나지 않는 쓰기는 실시간으로 못 잡는다 → 다음 세션 시작 때 무결성 검사가 잡는다. 훅이 오류로 죽으면 막지 않고 통과(작업 중단 방지). 사용자가 Claude 밖 터미널에서 실행한 것은 실시간 차단 불가(세션 시작 때 감지).
 
