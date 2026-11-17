@@ -7,6 +7,7 @@ skill-security-vetting 자동 감시 훅.
   guard.py baseline-init  현재 상태를 기준선으로 저장(처음 1회, 사용자 승인 후)
   guard.py accept <키|all> 변경을 확인·승인한 뒤 기준선 갱신 (Claude가 실행하면 항상 승인창이 뜸)
   guard.py status         기준선과 현재 차이만 출력
+  guard.py pause                     이 세션만 보안 스킬 끄기(세션 시작 질문에서 '끄기'를 골랐을 때, 시작 10분 안)
   guard.py vet-start <폴더>          점검 모드 켜기(이 세션만, 훅이 켬. 임시 폴더의 vet-… 폴더)
   guard.py vet-end <폴더> [--discard] 점검 모드 끄기 (--discard: 받은 코드 삭제, 승인 없음 / 아니면 승인창)
 
@@ -129,6 +130,44 @@ EXEMPT_WRITE = {
 # ------------------------------------------------------------------ 점검 모드 (스킬로 외부 코드를 점검하는 동안만)
 # 받은 코드가 컴퓨터에 있는 동안에는 '허용 목록' 방식: 정해진 읽기·점검 명령만 통과, 나머지는 오토 모드와 상관없이 차단.
 # 세션별로 켜짐(다른 Claude 세션·평소 작업에는 영향 없음). 2시간 지나면 저절로 꺼짐.
+
+SESS_STATE = os.path.join(STATE, "sessions")
+PAUSE_WINDOW = 10 * 60  # 세션 시작 뒤 이 시간 안에만 '이 세션 끄기' 가능 (나중에 속은 Claude가 몰래 끄는 것 방지)
+ASK_KEEP = ("[스킬 보안 감시] 이 세션을 시작했습니다. 사용자의 첫 요청을 처리하기 전에 AskUserQuestion으로 한 번만 물어보세요: "
+            "\"이 세션에서 보안 스킬(위험 명령 실시간 차단·외부 코드 점검 모드)을 유지할까요?\" "
+            "선택지 ① 유지 (권장) — 그대로 진행 ② 이 세션만 끄기 — 이 세션 동안 보안 스킬이 개입하지 않음(다음 세션에서 다시 물어봄). "
+            "② 를 고르면 바로 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py pause` 를 실행하세요(세션 시작 10분 안에만 됨). "
+            "답을 받을 수 없는 환경(백그라운드 실행 등)이면 묻지 말고 유지합니다.")
+
+
+def _sess_file(sid):
+    return os.path.join(SESS_STATE, re.sub(r"[^A-Za-z0-9_-]", "_", sid or "nosession")[:80] + ".json")
+
+
+def sess_load(sid):
+    try:
+        with open(_sess_file(sid), encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def sess_save(sid, st):
+    os.makedirs(SESS_STATE, exist_ok=True)
+    with open(_sess_file(sid), "w", encoding="utf-8") as fh:
+        json.dump(st, fh, ensure_ascii=False)
+
+
+def sess_cleanup():
+    """7일 지난 세션 기록 정리 (이 기능이 만든 sessions/*.json만)."""
+    try:
+        for fn in os.listdir(SESS_STATE):
+            fp = os.path.join(SESS_STATE, fn)
+            if fn.endswith(".json") and time.time() - os.path.getmtime(fp) > 7 * 86400:
+                os.remove(fp)
+    except Exception:
+        pass
+
 
 VET_STATE = os.path.join(STATE, "vet-mode")
 VET_TTL = 2 * 3600
@@ -657,6 +696,9 @@ def pretool():
     ti = data.get("tool_input") or {}
     sid = data.get("session_id") or "nosession"
     cwd = data.get("cwd") or os.getcwd()
+    sess = sess_load(sid)
+    if sess and sess.get("paused"):
+        return  # 사용자가 세션 시작 때 '이 세션만 끄기'를 고름 → 이 세션은 개입하지 않음
     vet = vet_load(sid)
 
     # 오토 모드에서도 끊기지 않게: 승인창(ask)은 기준선 변경 하나만 남기고,
@@ -701,6 +743,26 @@ def pretool():
         before = cmd[:m.start()].rsplit("\n", 1)[-1]
         return m.group(0) if re.search(r"\b(ba|z|da)?sh\s*(-s\s*)?$", before.strip()) else "<<HEREDOC"
     nohd = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?.*?\n.*?\n\1\b", _strip_data_heredoc, cmd, flags=re.S)
+
+    # 0-1) 이 세션만 끄기: 세션 시작 질문에 사용자가 '끄기'를 고른 경우. 시작 10분 안·점검 모드 아님일 때만
+    try:
+        ptoks = tokenize(cmd)
+    except ValueError:
+        ptoks = []
+    pw = [v for k, v in ptoks if k == "w"]
+    pause_cmd = any(w.endswith("guard.py") and pw[i + 1:i + 2] == ["pause"] for i, w in enumerate(pw))
+    if pause_cmd and (any(k == "op" for k, _ in ptoks) or pw[0] not in ("python3", "python") or pw[-1] != "pause" or len(pw) > 4):
+        decide("deny", "보안 스킬 끄기는 다른 명령과 섞지 말고 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py pause` 하나만 실행하세요.")
+    if pause_cmd:
+        if vet:
+            decide("deny", "외부 코드 점검 중에는 보안 스킬을 끌 수 없습니다. 점검을 먼저 끝내세요.")
+        if not sess or time.time() - sess.get("started", 0) > PAUSE_WINDOW:
+            decide("deny", "보안 스킬은 세션 시작 10분 안에, 시작 질문에 '이 세션만 끄기'를 골랐을 때만 끌 수 있습니다. 끄려면 /clear 후 새 세션 질문에서 고르세요.")
+        sess["paused"] = True
+        sess["paused_at"] = time.time()
+        sess_save(sid, sess)
+        log(f"session pause: {sid[:12]} (사용자 선택, 이 세션만)")
+        return
 
     # 0) 점검 모드 켜기: vet-start 명령, 또는 임시 폴더의 vet-… 폴더로 받기 시작하면 자동으로 (이 세션만)
     if not vet:
@@ -939,6 +1001,16 @@ def session():
     except Exception:
         data = {}
     cwd = data.get("cwd") or os.getcwd()
+    sid = data.get("session_id") or "nosession"
+    # 새 세션이면(같은 세션의 compact·resume은 제외) 시작 시각 기록 + '보안 스킬 유지?' 질문 안내
+    ask = ""
+    if not sess_load(sid):
+        try:
+            sess_save(sid, {"started": time.time(), "paused": False, "source": data.get("source", "")})
+            sess_cleanup()
+            ask = ASK_KEEP
+        except Exception:
+            ask = ""
     base = load_baseline()
     if base is None:
         out({"systemMessage": "[스킬 보안 감시] 기준선이 없습니다. 'guard.py baseline-init'으로 처음 1회 등록이 필요합니다."})
@@ -946,6 +1018,8 @@ def session():
     # 이 폴더의 프로젝트 설정이 기준선에 아직 없으면(처음 여는 프로젝트) 새로 생김으로 보고
     changes = diff(base, cur)
     if not changes:
+        if ask:
+            out({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ask}})
         return
     lines, ctx = [], []
     t0 = time.time()
@@ -964,7 +1038,7 @@ def session():
     log("session changes: " + "; ".join(f"{k}:{key}" for k, key, *_ in changes))
     out({"systemMessage": msg,
          "hookSpecificOutput": {"hookEventName": "SessionStart",
-                                "additionalContext": msg + "\n\n사용자에게 이 목록을 먼저 알리고, 바뀐 항목은 skill-security-vetting 4단계(직접 읽기)로 확인한 뒤 사용자가 승인하면 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py accept <키>`로 기준선을 갱신하세요. 확인 전에는 해당 스킬·플러그인을 쓰지 마세요."}})
+                                "additionalContext": msg + "\n\n사용자에게 이 목록을 먼저 알리고, 바뀐 항목은 skill-security-vetting 4단계(직접 읽기)로 확인한 뒤 사용자가 승인하면 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py accept <키>`로 기준선을 갱신하세요. 확인 전에는 해당 스킬·플러그인을 쓰지 마세요." + ("\n\n" + ask if ask else "")}})
 
 
 def cmd_baseline_init(cwds):
@@ -1024,6 +1098,8 @@ if __name__ == "__main__":
         cmd_accept(a[1:], os.getcwd())
     elif a[0] == "status":
         cmd_status(os.getcwd())
+    elif a[0] == "pause":
+        print("이 세션에서 보안 스킬이 개입하지 않습니다(다음 세션에서 다시 물어봄). 훅이 등록돼 있지 않으면 아무 변화가 없습니다.")
     elif a[0] == "vet-start" and len(a) >= 2:
         cmd_vet_start(a[1])
     elif a[0] == "vet-end" and len(a) >= 2:

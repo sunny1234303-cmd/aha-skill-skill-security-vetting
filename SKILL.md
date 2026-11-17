@@ -24,6 +24,14 @@ description: |
 
 ---
 
+## 세션 시작 질문 — "보안 스킬을 유지할까요?" (오토 모드여도 매 세션 1번)
+
+감시 훅을 등록했으면 새 세션(/clear 포함, 같은 세션의 compact·resume 제외)마다 SessionStart 훅이 Claude에게 질문을 지시한다. Claude는 사용자의 첫 요청을 처리하기 전에 `AskUserQuestion`으로 묻는다.
+- **유지 (권장)**: 그대로 진행. 위험 명령 실시간 차단·외부 코드 점검 모드가 이 세션에서 작동한다.
+- **이 세션만 끄기**: Claude가 바로 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py pause`를 **단독으로** 실행 → 이 세션 동안 PreToolUse 훅이 아무것도 막지 않는다. 다음 세션에서 다시 묻는다. 세션 시작 변경 검사(SessionStart)는 그대로.
+- 끄기는 **세션 시작 10분 안·점검 모드가 아닐 때·다른 명령과 섞지 않을 때만** 된다(나중에 받은 파일 속 지시에 속은 Claude가 몰래 끄는 것 방지). 그 뒤에 끄고 싶으면 /clear 후 새 세션 질문에서 고른다.
+- 답을 받을 수 없는 환경(백그라운드 실행 등)이면 묻지 않고 유지한다.
+
 ## 1단계 — 출처 신뢰도 (받기 전에, `gh api`로)
 
 `OWNER/REPO`를 URL에서 뽑고 아래를 조회한다.
@@ -178,6 +186,7 @@ python3 -I ~/.claude/skills/skill-security-vetting/scripts/install_verified.py <
    - **자동 차단**(확실한 악성): 스킬·플러그인·에이전트·커맨드·훅·settings·`.mcp.json`·`~/.claude.json` 경로에 외부에서 바로 받기(git clone·curl·wget·unzip·tar x) · 다운로드한 코드를 바로 실행(curl|sh, curl|python 등) · `~/.ssh`·키체인·브라우저 쿠키·클라우드/GitHub 자격증명 접근 · 웹훅·익명 업로드 주소로 전송 · 리버스 셸 · 권한 확인 우회. 차단된 작업이 꼭 필요하면 사용자가 직접 `! 명령`으로 실행한다.
    - **승인창**: 감시 기준선 변경(`guard.py accept`·`baseline-init`)과 `install_verified.py` 설치(기준선에 자동 등록됨), 점검 모드를 코드를 남긴 채 끄는 `vet-end` — 악성 스킬이 Claude를 속여 스스로 승인·설치하는 것을 막기 위해. 드물게만 뜬다.
    - **점검 모드**(2단계에서 켜짐, 이 세션만): 허용 목록 방식 — 정해진 조회·읽기·점검 명령만 통과하고 받은 코드 실행·점검 폴더 밖 쓰기·나머지 전부 자동 차단(오토 모드와 상관없이). 설치 성공·`vet-end <V> --discard`·2시간 경과 시 꺼진다. 상태: `state/vet-mode/<세션>.json`.
+   - **세션별 끄기**: 세션 시작 질문에서 "이 세션만 끄기"를 고르면 그 세션은 개입하지 않음(위 "세션 시작 질문" 절). 상태: `state/sessions/<세션>.json`(7일 지나면 자동 정리).
    - **기록만**(막지 않음, `state/guard-log.txt`에 `note`): 같은 경로에 쓰기·복사·삭제, `install_verified.py` 설치, `claude plugin install`·`claude mcp add`·`npx … mcp`, LaunchAgents·crontab·셸 rc 수정, Gatekeeper 해제, 화면·키 입력 조작. 스킬·설정 변경은 다음 세션 시작 때 2번 검사가 다시 잡는다.
    - `curl … | python3 -c "JSON 읽기"`(인라인 코드에 exec·eval 등이 없을 때)는 실행이 아니라 읽기로 보고 통과. 설정 파일을 grep하는 것처럼 따옴표 안 글자는 '권한 우회'로 보지 않는다.
 2. **SessionStart (세션 시작마다)** — 기준선(`state/baseline.json`, 파일별 SHA-256)과 비교해 새로 생기거나 바뀐 스킬·synced 스킬·플러그인 캐시·마켓플레이스·에이전트·커맨드·**훅/권한/MCP 설정**을 알리고, 바뀐 폴더는 자동 스캔(최대 15초). 터미널에서 직접 복사한 것, 플러그인·claude.ai 동기화 자동 업데이트, 누가 훅을 몰래 추가한 것까지 잡는다.
