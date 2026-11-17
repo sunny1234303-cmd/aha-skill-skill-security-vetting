@@ -54,6 +54,19 @@ def main():
         shutil.copyfile(s, d)  # 권한·속성은 복사하지 않음
         os.chmod(d, 0o644)
     print(f"설치 완료: {dest} (파일 {len(files)}개, 해시 일치, 실행권한 제거)")
+    # 점검 모드 끄기: 이 사본을 받은 vet-… 폴더의 점검 모드 상태 파일 삭제
+    vs = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "state", "vet-mode")
+    if os.path.isdir(vs):
+        for fn in os.listdir(vs):
+            fp = os.path.join(vs, fn)
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    vd = json.load(f).get("dir", "")
+                if vd and (src == vd or src.startswith(vd.rstrip(os.sep) + os.sep)):
+                    os.remove(fp)
+                    print("점검 모드 끔")
+            except Exception:
+                pass
     # 자동 감시 기준선에 '점검 통과본'으로 등록 (다음 세션에서 경고하지 않도록)
     import subprocess
     guard = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "guard.py")

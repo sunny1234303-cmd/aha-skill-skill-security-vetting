@@ -57,13 +57,19 @@ curl -s "https://api.securityscorecards.dev/projects/github.com/OWNER/REPO" | py
 
 ## 2단계 — 격리 다운로드 & 고정
 
+**점검 모드 (이 단계부터 설치·정리까지)**: 받은 코드가 컴퓨터에 있는 동안 감시 훅이 이 세션을 '허용 목록' 방식으로 바꾼다. 출처 조회(`gh api`·`gh search`), 아래 형태의 `git clone`·`git -C … log/show/diff`, OSV·Scorecard·GitHub 조회용 `curl`, 이 스킬의 `scan.py`·`install_verified.py`, 점검 폴더 안 파일 읽기(`cat`·`grep`·`rg`·`ls`·`find`·`head`·`sed -n '1,80p'`·`jq` 등)만 통과하고, 받은 코드 실행(`python`·`node`·`sh`·`npm`·`make`…)·점검 폴더 밖 쓰기·그 밖의 모든 명령은 오토 모드와 상관없이 차단된다. 다른 세션·평소 작업에는 영향이 없고, 2시간이 지나면 저절로 꺼진다.
+- 점검 모드에서는 **셸 변수(`$V`·`$SK`)와 `$(…)`를 쓸 수 없다** → 경로를 그대로 적는다(`~`는 됨). 아래 `<V>`는 mktemp가 출력한 실제 경로.
+- 끄기: 설치(6단계)가 성공하면 자동으로 꺼진다. 설치하지 않기로 하면 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py vet-end <V> --discard`(받은 코드 삭제, 승인창 없음). 코드를 남긴 채 끄는 `vet-end <V>`는 승인창이 뜬다(속은 Claude가 몰래 빠져나가는 것 방지).
+- 점검 모드 중에는 위키 로그·메모리 등 점검 폴더 밖 파일 쓰기도 막히므로 기록은 점검이 끝난 뒤에 한다.
+
 ```bash
-V="$(mktemp -d "${TMPDIR:-/tmp}/vet-REPO-XXXXXX")"   # 세션 스크래치 폴더가 있으면 그 아래로 바꿔도 됨
+mktemp -d "${TMPDIR:-/tmp}/vet-REPO-XXXXXX"        # ① 출력된 경로를 <V>로 기억 (세션 스크래치 폴더가 있으면 그 아래 vet-… 로 만들어도 됨)
+python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py vet-start <V>   # ② 점검 모드 켜기(clone만 해도 자동으로 켜짐)
 GIT_TERMINAL_PROMPT=0 git -c core.hooksPath=/dev/null -c protocol.file.allow=never -c core.symlinks=false \
-  clone --no-recurse-submodules --depth 100 "https://github.com/OWNER/REPO.git" "$V/src"
-git -C "$V/src" rev-parse HEAD                     # ← SHA 기록
-git -C "$V/src" log --format='%h %G? %an <%ae> %ad %s' --date=short -n 30
-git -C "$V/src" log --stat --format='--- %h %an %ad %s' --date=short -n 5   # 최근 변경 파일
+  clone --no-recurse-submodules --depth 100 https://github.com/OWNER/REPO.git <V>/src
+git -C <V>/src rev-parse HEAD                     # ← SHA 기록
+git -C <V>/src log --format='%h %G? %an <%ae> %ad %s' --date=short -n 30
+git -C <V>/src log --stat --format='--- %h %an %ad %s' --date=short -n 5   # 최근 변경 파일
 ```
 - `core.symlinks=false`: 링크를 실제 링크로 만들지 않음(링크 대상 정보는 파일 내용으로 남아 스캔됨).
 - 하위 폴더 스킬(`.../tree/main/skills/foo`)이면 저장소 전체를 받되 점검·설치 대상은 그 폴더. 단, 그 폴더가 상위 폴더 파일(스크립트·의존성)을 참조하면 그것도 대상에 포함.
@@ -78,7 +84,7 @@ gh api "repos/PARENT_OWNER/PARENT_REPO/compare/PARENT_BRANCH...OWNER:REPO:BRANCH
 ## 3단계 — 정적 스캔 (스크립트)
 
 ```bash
-python3 -I "$SK/scripts/scan.py" "$V/src" "$V/report.md" "$V/scan.json"
+python3 -I ~/.claude/skills/skill-security-vetting/scripts/scan.py <V>/src <V>/report.md <V>/scan.json
 ```
 잡는 것: 원격 즉시 실행(`curl|sh`), 파괴적 명령, 권한 상승·Gatekeeper 해제, 지속성(LaunchAgents·crontab·셸 rc), Claude 설정·훅·권한 우회 시도, 민감 파일 접근(SSH·클라우드 키·키체인·브라우저 쿠키·gh 토큰·.env), 유출 경로(메신저 웹훅·요청 수집·익명 업로드·리버스 셸·IP 직접·터널·DNS), 동적 실행·안전하지 않은 역직렬화, 난독화(디코딩 후 실행·긴 base64·매우 긴 줄), 실행 중 원격 지시, 영/한 프롬프트 인젝션, 숨은 유니코드(양방향·태그문자 해독·폭 없는 문자·ANSI), 동형문자, 마크다운 HTML 주석, 자동 실행 파일(`.envrc`·`.claude/settings.json`·`.mcp.json`·`.vscode/tasks.json`·devcontainer·서브모듈·`.npmrc`·`setup.py`·플러그인 훅·Actions `pull_request_target`), npm install 훅, 의존성(레지스트리 밖·버전 미고정·인덱스 바꿔치기), 바이너리·실행파일·이미지 속 코드, 폴더 밖 심볼릭링크, 프론트매터 `hooks`·제한 없는 `Bash`.
 
@@ -103,11 +109,11 @@ python3 -I "$SK/scripts/scan.py" "$V/src" "$V/report.md" "$V/scan.json"
 5. **권한 범위**: `allowed-tools`·MCP 권한이 기능에 필요한 최소인지.
 6. **의존성**: 3단계 JSON의 `의존성` 목록을 OSV로 조회(무료·공개 API, 패키지 이름만 전송).
    ```bash
-   # osv-scanner가 설치돼 있으면: osv-scanner scan source -r "$V/src"
+   # osv-scanner가 설치돼 있으면: osv-scanner scan source -r <V>/src
    curl -s https://api.osv.dev/v1/query -d '{"package":{"name":"PKG","ecosystem":"PyPI"},"version":"VER"}'
    ```
    이름이 유명 패키지와 한두 글자 다르면(예: `reqeusts`) 타이포스쿼팅 → 위험.
-7. 설치돼 있으면 추가로(없으면 설치하지 말고 건너뛰었다고 보고): `gitleaks detect --source "$V/src" --no-banner`(히스토리 포함 시크릿), `semgrep --config auto "$V/src"`(⚠️ `auto`는 메트릭 전송 → `--metrics=off --config p/default`).
+7. 설치돼 있으면 추가로(없으면 설치하지 말고 건너뛰었다고 보고): `gitleaks detect --source <V>/src --no-banner`(히스토리 포함 시크릿), `semgrep --metrics=off --config p/default <V>/src`(`--config auto`는 메트릭을 보내므로 쓰지 않음, 점검 모드도 `--metrics=off`만 허용).
 
 ## 5단계 — 보고
 
@@ -125,13 +131,15 @@ python3 -I "$SK/scripts/scan.py" "$V/src" "$V/report.md" "$V/scan.json"
 - 🔴: 위험 항목이 실제 동작 경로에 있음 (유출·지속성·인젝션·원격 즉시 실행·폴더 밖 링크 등)
 - 🟡: 주의만 있고 기능상 이유가 설명됨 (예: API 호출 스킬의 네트워크 사용)
 - 🟢: 위험 0, 주의는 전부 오탐으로 확인됨
-- 스캐너 원본 리포트 `$V/report.md` 경로를 함께 알려준다.
+- 스캐너 원본 리포트 `<V>/report.md` 경로를 함께 알려준다.
 
 ## 6단계 — 설치 (승인 후에만)
 
 ```bash
-python3 -I "$SK/scripts/install_verified.py" "$V/src/<스킬폴더>" "$V/scan.json" ~/.claude/skills/<이름>
+python3 -I ~/.claude/skills/skill-security-vetting/scripts/install_verified.py <V>/src/<스킬폴더> <V>/scan.json ~/.claude/skills/<이름>
 ```
+- 이 명령은 **승인창이 한 번 뜬다**(설치하면서 감시 기준선에도 등록되므로, 속은 Claude가 몰래 설치하는 것 방지). 설치가 끝나면 점검 모드가 자동으로 꺼진다.
+- 설치하지 않기로 했으면: `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py vet-end <V> --discard` (받은 코드 삭제 + 점검 모드 끔, 승인창 없음).
 - 스캔은 **설치할 폴더 자체**를 대상으로 돌린 JSON이어야 한다(하위 폴더 스킬이면 그 폴더로 3단계를 다시 실행).
 - 해시가 하나라도 다르거나 새 파일이 생기면 중단된다. 설치 위치가 이미 있으면 덮어쓰지 않는다(교체는 사용자 승인 후 기존 폴더를 백업하고 진행).
 - 실행 권한은 전부 빠진다. 스크립트는 `python3 스크립트` 식으로 실행되니 대개 문제없음.
@@ -166,16 +174,17 @@ python3 -I "$SK/scripts/install_verified.py" "$V/src/<스킬폴더>" "$V/scan.js
 ## 자동 감시 (훅, 위 설치 절차로 `~/.claude/settings.json`에 등록)
 
 `hooks/guard.py` 두 겹:
-1. **PreToolUse (실시간)** — Bash·Write·Edit 직전 검사. **오토 모드를 끊지 않도록 승인창은 기준선 변경 하나뿐**이다.
+1. **PreToolUse (실시간)** — Bash·Write·Edit 직전 검사. **오토 모드를 끊지 않도록 승인창은 기준선 변경과 외부 스킬 설치뿐**이다.
    - **자동 차단**(확실한 악성): 스킬·플러그인·에이전트·커맨드·훅·settings·`.mcp.json`·`~/.claude.json` 경로에 외부에서 바로 받기(git clone·curl·wget·unzip·tar x) · 다운로드한 코드를 바로 실행(curl|sh, curl|python 등) · `~/.ssh`·키체인·브라우저 쿠키·클라우드/GitHub 자격증명 접근 · 웹훅·익명 업로드 주소로 전송 · 리버스 셸 · 권한 확인 우회. 차단된 작업이 꼭 필요하면 사용자가 직접 `! 명령`으로 실행한다.
-   - **승인창**: 감시 기준선 변경(`guard.py accept`·`baseline-init`)만 — 악성 스킬이 Claude를 속여 스스로 승인하는 것을 막기 위해. 드물게만 뜬다.
+   - **승인창**: 감시 기준선 변경(`guard.py accept`·`baseline-init`)과 `install_verified.py` 설치(기준선에 자동 등록됨), 점검 모드를 코드를 남긴 채 끄는 `vet-end` — 악성 스킬이 Claude를 속여 스스로 승인·설치하는 것을 막기 위해. 드물게만 뜬다.
+   - **점검 모드**(2단계에서 켜짐, 이 세션만): 허용 목록 방식 — 정해진 조회·읽기·점검 명령만 통과하고 받은 코드 실행·점검 폴더 밖 쓰기·나머지 전부 자동 차단(오토 모드와 상관없이). 설치 성공·`vet-end <V> --discard`·2시간 경과 시 꺼진다. 상태: `state/vet-mode/<세션>.json`.
    - **기록만**(막지 않음, `state/guard-log.txt`에 `note`): 같은 경로에 쓰기·복사·삭제, `install_verified.py` 설치, `claude plugin install`·`claude mcp add`·`npx … mcp`, LaunchAgents·crontab·셸 rc 수정, Gatekeeper 해제, 화면·키 입력 조작. 스킬·설정 변경은 다음 세션 시작 때 2번 검사가 다시 잡는다.
    - `curl … | python3 -c "JSON 읽기"`(인라인 코드에 exec·eval 등이 없을 때)는 실행이 아니라 읽기로 보고 통과. 설정 파일을 grep하는 것처럼 따옴표 안 글자는 '권한 우회'로 보지 않는다.
 2. **SessionStart (세션 시작마다)** — 기준선(`state/baseline.json`, 파일별 SHA-256)과 비교해 새로 생기거나 바뀐 스킬·synced 스킬·플러그인 캐시·마켓플레이스·에이전트·커맨드·**훅/권한/MCP 설정**을 알리고, 바뀐 폴더는 자동 스캔(최대 15초). 터미널에서 직접 복사한 것, 플러그인·claude.ai 동기화 자동 업데이트, 누가 훅을 몰래 추가한 것까지 잡는다.
 
 알림이 오면: 사용자에게 목록을 먼저 보여주고 → 4단계(직접 읽기)로 확인 → 승인받으면 `python3 -I ~/.claude/skills/skill-security-vetting/hooks/guard.py accept <키>` (실시간 감시에서 승인창이 뜨는 유일한 명령). 현재 차이만 보기: `guard.py status`. 로그: `state/guard-log.txt`.
 
-**알려진 한계 (정직하게):** 파이썬 스크립트 *안에서* 파일을 쓰는 경우처럼 명령 문자열에 드러나지 않는 쓰기는 실시간으로 못 잡는다 → 다음 세션 시작 때 무결성 검사가 잡는다. 훅이 오류로 죽으면 막지 않고 통과(작업 중단 방지). 사용자가 Claude 밖 터미널에서 실행한 것은 실시간 차단 불가(세션 시작 때 감지).
+**알려진 한계 (정직하게):** 점검 모드가 아닐 때는 "나쁜 것 목록" 방식이라 base64·변수 쪼개기·스크립트 파일 안에 숨긴 명령은 실시간으로 못 잡는다(그래서 외부 코드는 반드시 이 스킬의 점검 모드 안에서만 다룬다). 점검 모드도 운영체제 샌드박스는 아니라서, 허용한 이 스킬의 스크립트는 그대로 실행되고 WebFetch처럼 감시 대상이 아닌 도구는 막지 않는다. 파이썬 스크립트 *안에서* 파일을 쓰는 경우처럼 명령 문자열에 드러나지 않는 쓰기는 실시간으로 못 잡는다 → 다음 세션 시작 때 무결성 검사가 잡는다. 훅이 오류로 죽으면 막지 않고 통과(작업 중단 방지). 사용자가 Claude 밖 터미널에서 실행한 것은 실시간 차단 불가(세션 시작 때 감지).
 
 ## 하지 않는 것
 - 받은 코드 실행·테스트 실행·샌드박스 없는 동적 분석

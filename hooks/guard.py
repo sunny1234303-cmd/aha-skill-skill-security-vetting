@@ -7,6 +7,8 @@ skill-security-vetting 자동 감시 훅.
   guard.py baseline-init  현재 상태를 기준선으로 저장(처음 1회, 사용자 승인 후)
   guard.py accept <키|all> 변경을 확인·승인한 뒤 기준선 갱신 (Claude가 실행하면 항상 승인창이 뜸)
   guard.py status         기준선과 현재 차이만 출력
+  guard.py vet-start <폴더>          점검 모드 켜기(이 세션만, 훅이 켬. 임시 폴더의 vet-… 폴더)
+  guard.py vet-end <폴더> [--discard] 점검 모드 끄기 (--discard: 받은 코드 삭제, 승인 없음 / 아니면 승인창)
 
 표준 라이브러리만 사용, 네트워크 없음, 대상 파일은 읽기만 함.
 """
@@ -60,7 +62,7 @@ WRITE_VERB = re.compile(
     r"curl|wget|gh\s+repo\s+clone|npx|bunx|pip3?\s+install|npm\s+(i|install)|find\s.*-delete)\b"
     r"|>>?\s*\S|\bopen\([^)]*['\"][wa]"
 )
-FETCH_VERB = re.compile(r"\b(git\s+clone|gh\s+repo\s+clone|curl|wget|unzip|tar\s+-?[a-zA-Z]*x|svn\s+(checkout|export)|degit)\b")
+FETCH_VERB = re.compile(r"\b(git(\s+-[cC]\s+\S+|\s+--[\w-]+(=\S+)?)*\s+clone|gh\s+repo\s+clone|curl|wget|unzip|tar\s+-?[a-zA-Z]*x|svn\s+(checkout|export)|degit)\b")
 INSTALL_CMD = re.compile(
     r"\bclaude\s+(plugins?\s+(install|add|update|marketplace)|mcp\s+add)|\bnpx\s+(-y\s+)?[^\s]*skills?\b|"
     r"\b(npx|bunx|uvx|pipx)\s+(-y\s+|run\s+)?[^\s]*mcp[^\s]*"
@@ -124,6 +126,528 @@ EXEMPT_WRITE = {
 }
 
 
+# ------------------------------------------------------------------ 점검 모드 (스킬로 외부 코드를 점검하는 동안만)
+# 받은 코드가 컴퓨터에 있는 동안에는 '허용 목록' 방식: 정해진 읽기·점검 명령만 통과, 나머지는 오토 모드와 상관없이 차단.
+# 세션별로 켜짐(다른 Claude 세션·평소 작업에는 영향 없음). 2시간 지나면 저절로 꺼짐.
+
+VET_STATE = os.path.join(STATE, "vet-mode")
+VET_TTL = 2 * 3600
+VET_PATH = re.compile(r"(/[^\s'\"]*?/vet-[A-Za-z0-9._-]+)(?=/|[\s'\"]|$)")
+
+
+def _tmp_roots():
+    roots = set()
+    for p in (os.environ.get("TMPDIR"), "/tmp", "/private/tmp", "/var/folders", "/private/var/folders"):
+        if p:
+            roots.add(os.path.realpath(p))
+    return roots
+
+
+def inside(p, root):
+    return p == root or p.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _sid_file(sid):
+    return os.path.join(VET_STATE, re.sub(r"[^A-Za-z0-9_-]", "_", sid or "nosession")[:80] + ".json")
+
+
+def vet_load(sid):
+    f = _sid_file(sid)
+    try:
+        with open(f, encoding="utf-8") as fh:
+            st = json.load(fh)
+    except Exception:
+        return None
+    if time.time() > st.get("expires", 0):
+        try:
+            os.remove(f)
+        except Exception:
+            pass
+        log(f"vet-mode 만료로 꺼짐: {st.get('dir')}")
+        return None
+    return st
+
+
+def vet_valid_dir(d):
+    """점검 폴더로 쓸 수 있는지: 임시 폴더 아래의 vet-… 폴더만."""
+    rd = os.path.realpath(os.path.expanduser(d))
+    if not os.path.basename(rd).startswith("vet-"):
+        return None
+    if not any(inside(rd, r) and rd != r for r in _tmp_roots()):
+        return None
+    return rd
+
+
+def vet_start(sid, d):
+    os.makedirs(VET_STATE, exist_ok=True)
+    st = {"dir": d, "session": sid, "started": time.time(), "expires": time.time() + VET_TTL}
+    with open(_sid_file(sid), "w", encoding="utf-8") as fh:
+        json.dump(st, fh, ensure_ascii=False)
+    log(f"vet-mode 켜짐: {d.replace(HOME, '~')}")
+    return st
+
+
+def vet_states():
+    out_ = []
+    try:
+        for fn in os.listdir(VET_STATE):
+            if fn.endswith(".json"):
+                p = os.path.join(VET_STATE, fn)
+                try:
+                    with open(p, encoding="utf-8") as fh:
+                        out_.append((p, json.load(fh)))
+                except Exception:
+                    pass
+    except FileNotFoundError:
+        pass
+    return out_
+
+
+_OPS = ["&&", "||", ";;", ">>", ">&", "|&", "<<", "<", ">", "|", "&", ";", "(", ")", "\n"]
+
+
+def tokenize(s):
+    """셸 명령을 단어·연산자로 나눈다(따옴표 안 글자는 단어). 해석이 애매하면 ValueError."""
+    toks, cur, i, n = [], None, 0, len(s)
+
+    def flush():
+        nonlocal cur
+        if cur is not None:
+            toks.append(("w", cur))
+            cur = None
+    while i < n:
+        c = s[i]
+        if c in " \t\r":
+            flush()
+            i += 1
+        elif c == "\\":
+            if i + 1 < n and s[i + 1] == "\n":
+                i += 2
+                continue
+            if i + 1 >= n:
+                raise ValueError("끝의 \\")
+            cur = (cur or "") + s[i + 1]
+            i += 2
+        elif c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                raise ValueError("따옴표 짝 없음")
+            cur = (cur or "") + s[i + 1:j]
+            i = j + 1
+        elif c == '"':
+            j, buf = i + 1, ""
+            while j < n and s[j] != '"':
+                if s[j] == "\\" and j + 1 < n and s[j + 1] in '"\\$`':
+                    buf += s[j + 1]
+                    j += 2
+                else:
+                    buf += s[j]
+                    j += 1
+            if j >= n:
+                raise ValueError("따옴표 짝 없음")
+            cur = (cur or "") + buf
+            i = j + 1
+        elif c == "#" and cur is None:
+            while i < n and s[i] != "\n":
+                i += 1
+        else:
+            op = next((o for o in _OPS if s.startswith(o, i)), None)
+            if op:
+                flush()
+                toks.append(("op", op))
+                i += len(op)
+            else:
+                cur = (cur or "") + c
+                i += 1
+    flush()
+    return toks
+
+
+VET_ENV_OK = {"GIT_TERMINAL_PROMPT", "LC_ALL", "LANG", "NO_COLOR"}
+VET_HOSTS = {"api.github.com", "github.com", "codeload.github.com", "raw.githubusercontent.com", "objects.githubusercontent.com",
+             "api.securityscorecards.dev", "api.osv.dev", "osv.dev", "registry.npmjs.org", "pypi.org"}
+VET_GIT_C_OK = {"core.hooksPath=/dev/null", "protocol.file.allow=never", "core.symlinks=false", "advice.detachedHead=false", "color.ui=never"}
+VET_GIT_SUB = {"clone", "rev-parse", "log", "show", "diff", "branch", "ls-files", "ls-tree", "cat-file", "rev-list", "shortlog", "blame"}
+PY_IMPORT_OK = {"sys", "json", "re", "collections", "itertools", "textwrap", "unicodedata", "hashlib", "string"}
+PY_CODE_BAD = re.compile(r"\b(exec|eval|compile|__import__|subprocess|os|runpy|importlib|open|shutil|socket|urllib|http|ctypes|pty|"
+                         r"pathlib|builtins|getattr|setattr|globals|locals|vars|marshal|pickle|codecs|base64|input|breakpoint|help)\b|__")
+# 파일을 인자로 받는 읽기 명령: {명령: 값을 받는 옵션(그 값은 경로로 보지 않음)}
+VET_READ = {
+    "cat": set(), "ls": set(), "wc": set(), "file": set(), "nl": {"-b", "-w", "-s"}, "column": {"-s", "-c"},
+    "head": {"-n", "-c"}, "tail": {"-n", "-c"}, "stat": {"-f", "-t"}, "shasum": {"-a"}, "sha256sum": set(), "md5": set(),
+    "xxd": {"-l", "-s", "-c", "-g"}, "od": {"-N", "-j", "-t", "-A"}, "hexdump": {"-n", "-s"}, "strings": {"-n"},
+    "diff": {"-U"}, "cmp": set(), "du": {"-d"}, "sort": {"-k", "-t"}, "realpath": set(), "tree": {"-L"},
+}
+VET_PLAIN = {"echo", "printf", "true", "pwd", "basename", "dirname", "date"}
+FIRST_IS_PATTERN = {"grep": {"-m", "-A", "-B", "-C", "--include", "--exclude", "--exclude-dir"},
+                    "egrep": {"-m", "-A", "-B", "-C"},
+                    "rg": {"-m", "-A", "-B", "-C", "-g", "--glob", "-t", "--type", "-T", "--max-count"},
+                    "jq": set()}
+
+
+def vet_check(cmd, cwd, vdir):
+    """점검 모드에서 이 명령을 허용하면 None, 아니면 ('deny'|'ask', 이유)."""
+    roots_r = [vdir, os.path.realpath(SK)]
+    roots_w = [vdir]
+    nosq = re.sub(r"'[^']*'", "''", cmd)
+    if re.search(r"\$|`", nosq):
+        return ("deny", "변수·명령 치환($, `)은 쓸 수 없습니다. 경로를 그대로 적어 주세요.")
+    if "<<" in nosq:
+        return ("deny", "입력 본문(<<)은 쓸 수 없습니다.")
+    norm = re.sub(r"(?<![\w/.\-])\d+(?=>)", "", cmd)  # 2>/dev/null → >/dev/null (해석용)
+    try:
+        toks = tokenize(norm)
+    except ValueError as e:
+        return ("deny", f"명령을 해석할 수 없습니다({e}).")
+
+    here = {"cwd": cwd}  # 같은 명령 안의 cd 반영
+
+    def res(p):
+        p = os.path.expanduser(p)
+        return os.path.realpath(p if os.path.isabs(p) else os.path.join(here["cwd"], p))
+
+    def pathlike(t):
+        return "/" in t or t.startswith("~") or t.startswith(".") or os.path.lexists(res(t))
+
+    def ok_path(t, roots):
+        if t in ("-", "/dev/null", "/dev/stdin"):
+            return True
+        r = res(t)
+        return any(inside(r, x) for x in roots)
+
+    def need(t, roots, what="점검 폴더"):
+        if not ok_path(t, roots):
+            raise PermissionError(f"{what} 밖 경로: {t}")
+
+    segs, cur = [], []
+    for k, v in toks:
+        if k == "op" and v in ("&&", "||", ";", "|", "\n", "&"):
+            segs.append(cur)
+            cur = []
+        elif k == "op" and v in ("(", ")", "|&", ";;", "<<"):
+            return ("deny", f"쓸 수 없는 문법: {v!r}")
+        else:
+            cur.append((k, v))
+    segs.append(cur)
+
+    try:
+        for seg in segs:
+            words, i = [], 0
+            while i < len(seg):
+                k, v = seg[i]
+                if k == "op":
+                    if i + 1 >= len(seg) or seg[i + 1][0] != "w":
+                        raise PermissionError(f"방향 기호 {v} 뒤 대상 없음")
+                    tgt = seg[i + 1][1]
+                    if v in (">", ">>"):
+                        need(tgt, roots_w, "점검 폴더(쓰기)")
+                    elif v == ">&":
+                        if not (tgt.isdigit() or tgt == "-"):
+                            raise PermissionError(">& 뒤에는 숫자만")
+                    elif v == "<":
+                        need(tgt, roots_r)
+                    i += 2
+                    continue
+                words.append(v)
+                i += 1
+            while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
+                name = words[0].split("=", 1)[0]
+                if name not in VET_ENV_OK:
+                    raise PermissionError(f"환경변수 설정 불가: {name}")
+                words = words[1:]
+            if not words:
+                continue
+            prog, args = words[0], words[1:]
+            if "/" in prog:
+                raise PermissionError(f"경로로 프로그램 실행 불가: {prog}")
+            r = _vet_prog(prog, args, here["cwd"], vdir, roots_r, roots_w, res, pathlike, need)
+            if r:
+                return r
+            if prog == "cd" and args:
+                here["cwd"] = res(args[-1])
+    except PermissionError as e:
+        return ("deny", str(e))
+    return None
+
+
+def _vet_prog(prog, args, cwd, vdir, roots_r, roots_w, res, pathlike, need):
+    opts_flags = [a for a in args if a.startswith("-")]
+
+    def files(args, valopts, skip_first=False):
+        skip, first_done = False, not skip_first
+        for a in args:
+            if skip:
+                skip = False
+                continue
+            if a.startswith("-") and a != "-":
+                if "=" in a:
+                    v = a.split("=", 1)[1]
+                    if pathlike(v):
+                        need(v, roots_r)
+                elif a in valopts or (prog in FIRST_IS_PATTERN and a in ("-e", "--regexp")):
+                    skip = True
+                    if a in ("-e", "--regexp"):
+                        first_done = True
+                continue
+            if not first_done:
+                first_done = True
+                continue
+            if pathlike(a):
+                need(a, roots_r)
+
+    if prog in VET_PLAIN:
+        return None
+    if prog == "cd":
+        for a in args:
+            need(a, roots_r)
+        return None
+    if prog in VET_READ:
+        files(args, VET_READ[prog])
+        return None
+    if prog in FIRST_IS_PATTERN:
+        if prog == "rg" and any(a.startswith(("--pre", "-z", "--search-zip")) for a in args):
+            raise PermissionError("rg --pre/-z(외부 프로그램 실행) 불가")
+        if prog == "jq" and any(a in ("--rawfile", "--slurpfile", "-L") or a.startswith("--rawfile") for a in args):
+            raise PermissionError("jq --rawfile/--slurpfile 불가")
+        if any(a in ("-f", "--file") or a.startswith("--file=") for a in args):
+            raise PermissionError("패턴 파일(-f) 불가")
+        files(args, FIRST_IS_PATTERN[prog], skip_first=True)
+        return None
+    if prog == "sed":
+        if any(a.startswith("-") and "i" in a.lstrip("-") for a in opts_flags) or "-n" not in args:
+            raise PermissionError("sed는 `sed -n '시작,끝p' 파일` 형태만")
+        pos = [a for a in args if not a.startswith("-")]
+        if not pos or not re.fullmatch(r"\d+(,(\d+|\$))?p", pos[0]):
+            raise PermissionError("sed는 `sed -n '시작,끝p' 파일` 형태만")
+        for a in pos[1:]:
+            need(a, roots_r)
+        return None
+    if prog == "find":
+        bad = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+        if any(a in bad for a in args):
+            raise PermissionError("find의 -exec/-delete 등은 불가")
+        for a in args:
+            if a.startswith("-") or a in ("(", ")", "!"):
+                break
+            need(a, roots_r)
+        return None
+    if prog == "mkdir":
+        for a in args:
+            if not a.startswith("-"):
+                need(a, roots_w, "점검 폴더(쓰기)")
+        return None
+    if prog in ("cp", "ditto"):
+        pos = [a for a in args if not a.startswith("-")]
+        if len(pos) < 2:
+            raise PermissionError("cp는 `cp -R 원본 점검폴더/…` 형태만")
+        need(pos[-1], roots_w, "점검 폴더(쓰기)")
+        return None
+    if prog == "unzip":
+        if "-l" in args or "-Z" in args or "-v" in args:
+            return None
+        if "-d" not in args:
+            raise PermissionError("unzip은 -l(목록) 또는 -d 점검폴더 로만")
+        need(args[args.index("-d") + 1], roots_w, "점검 폴더(쓰기)")
+        return None
+    if prog == "tar":
+        if any(a.startswith(("--to-command", "--use-compress", "--checkpoint", "-I")) for a in args):
+            raise PermissionError("tar 외부 프로그램 옵션 불가")
+        mode = (args[0].lstrip("-") if args else "")
+        if "t" in mode:
+            return None
+        if "x" in mode and "-C" in args:
+            need(args[args.index("-C") + 1], roots_w, "점검 폴더(쓰기)")
+            return None
+        raise PermissionError("tar는 -t(목록) 또는 -x … -C 점검폴더 로만")
+    if prog == "gh":
+        sub = args[0] if args else ""
+        if sub == "api":
+            if any(a in ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input") or
+                   a.startswith(("--method=", "--field=", "--raw-field=", "--input=", "-f", "-F")) for a in args[1:]):
+                raise PermissionError("gh api는 조회(GET)만")
+            return None
+        if sub == "search" or (sub == "repo" and args[1:2] == ["view"]):
+            return None
+        raise PermissionError("gh는 api 조회·search·repo view만")
+    if prog == "git":
+        i, gdir, has_hooks_off = 0, None, False
+        while i < len(args) and args[i].startswith("-"):
+            a = args[i]
+            if a == "-C":
+                gdir = args[i + 1]
+                i += 2
+            elif a == "-c":
+                if args[i + 1] not in VET_GIT_C_OK:
+                    raise PermissionError(f"git -c {args[i + 1]} 불가")
+                has_hooks_off |= args[i + 1] == "core.hooksPath=/dev/null"
+                i += 2
+            elif a == "--no-pager":
+                i += 1
+            else:
+                raise PermissionError(f"git 옵션 불가: {a}")
+        sub = args[i] if i < len(args) else ""
+        rest = args[i + 1:]
+        if sub not in VET_GIT_SUB:
+            raise PermissionError(f"git {sub} 불가 (조회·clone만)")
+        if any(a.startswith(("--upload-pack", "--config", "--template", "--exec", "--ext-diff", "--output", "-u", "--recurse-submodules"))
+               for a in rest):
+            raise PermissionError("git 위험 옵션 불가")
+        if sub == "clone":
+            if not has_hooks_off:
+                raise PermissionError("clone은 `git -c core.hooksPath=/dev/null -c protocol.file.allow=never -c core.symlinks=false clone …` 로만")
+            pos, skip = [], False
+            for a in rest:
+                if skip:
+                    skip = False
+                elif a in ("--depth", "-b", "--branch", "--filter"):
+                    skip = True
+                elif not a.startswith("-"):
+                    pos.append(a)
+            if len(pos) != 2:
+                raise PermissionError("clone은 주소와 점검폴더 대상을 적어 주세요")
+            m = re.match(r"^https://([^/@:]+)/", pos[0])
+            if not m or m.group(1) not in VET_HOSTS:
+                raise PermissionError(f"clone 주소 불가: {pos[0]}")
+            need(pos[1], roots_w, "점검 폴더(쓰기)")
+            return None
+        if gdir is not None:
+            need(gdir, [vdir])
+        elif not any(inside(os.path.realpath(cwd), x) for x in [vdir]):
+            raise PermissionError("git 조회는 -C 점검폴더/src 로")
+        return None
+    if prog == "curl":
+        valopts = {"-d", "--data", "--data-raw", "--data-binary", "-H", "--header", "-o", "--output", "-A", "-m",
+                   "--max-time", "-w", "--connect-timeout", "--retry", "-X", "--request"}
+        bad = {"-T", "--upload-file", "-F", "--form", "--form-string", "-K", "--config", "-O", "--remote-name",
+               "-x", "--proxy", "--unix-socket", "-u", "--user", "--output-dir", "-b", "--cookie", "-c", "--cookie-jar"}
+        i = 0
+        while i < len(args):
+            a = args[i]
+            if a in bad or a.split("=", 1)[0] in bad:
+                raise PermissionError(f"curl {a} 불가")
+            if a in valopts:
+                v = args[i + 1] if i + 1 < len(args) else ""
+                if a in ("-d", "--data", "--data-raw", "--data-binary") and v.startswith("@"):
+                    raise PermissionError("curl -d @파일(파일 내용 전송) 불가")
+                if a in ("-o", "--output"):
+                    need(v, roots_w, "점검 폴더(쓰기)")
+                i += 2
+                continue
+            if a.startswith("-"):
+                if not re.fullmatch(r"-[sSLfkvI]+|--(silent|show-error|location|fail|compressed|globoff|http1\.1|head)", a):
+                    raise PermissionError(f"curl 옵션 불가: {a}")
+                i += 1
+                continue
+            m = re.match(r"^https://([^/@:?#]+)", a)
+            if not m or m.group(1) not in VET_HOSTS:
+                raise PermissionError(f"curl 주소 불가(허용: GitHub·OSV·Scorecard 조회): {a}")
+            i += 1
+        return None
+    if prog in ("python3", "python"):
+        i = 0
+        flags = []
+        while i < len(args) and re.fullmatch(r"-[IBusE]+", args[i]):
+            flags.append(args[i])
+            i += 1
+        if not any("I" in f for f in flags):
+            raise PermissionError("python은 항상 -I")
+        rest = args[i:]
+        if rest[:1] == ["-c"]:
+            code = rest[1] if len(rest) > 1 else ""
+            if len(rest) > 2:
+                raise PermissionError("python -c 뒤 인자 불가")
+            for m in re.finditer(r"(?:^|[;\n])\s*(?:import\s+([\w., ]+)|from\s+(\w+)\s+import)", code):
+                names = [x.strip().split(" ")[0] for x in (m.group(1) or m.group(2)).split(",")]
+                if any(x not in PY_IMPORT_OK for x in names):
+                    raise PermissionError(f"python -c 에서 쓸 수 없는 모듈: {names}")
+            if PY_CODE_BAD.search(code):
+                raise PermissionError("python -c 에서 실행·파일 쓰기 함수 불가 (읽어서 출력만)")
+            return None
+        if not rest:
+            raise PermissionError("python 대화형 실행 불가")
+        script = res(rest[0])
+        sargs = rest[1:]
+        if script == os.path.realpath(SCAN):
+            for a in sargs:
+                need(a, roots_w, "점검 폴더")
+            return None
+        if script == os.path.realpath(os.path.join(SK, "scripts", "install_verified.py")):
+            if len(sargs) != 3:
+                raise PermissionError("install_verified.py 인자 3개")
+            need(sargs[0], roots_w)
+            need(sargs[1], roots_w)
+            dparent = os.path.dirname(res(sargs[2]))
+            okp = {os.path.realpath(os.path.join(CL, x)) for x in ("skills", "agents", "commands")}
+            okp |= {os.path.realpath(os.path.join(cwd, ".claude", x)) for x in ("skills", "agents", "commands")}
+            if dparent not in okp:
+                raise PermissionError("설치 위치는 ~/.claude/skills(agents·commands)/<이름> 만")
+            return None
+        if script == os.path.realpath(os.path.abspath(__file__)):
+            sub = sargs[0] if sargs else ""
+            if sub == "status" or sub == "vet-start":
+                return None
+            if sub == "vet-end":
+                if "--discard" in sargs:
+                    return None
+                return ("ask", "점검 모드를 끄려고 합니다(받은 코드는 남겨 둠). 직접 요청하신 게 맞으면 승인하세요. "
+                               "받은 코드가 필요 없으면 `vet-end <폴더> --discard`는 승인 없이 됩니다.")
+            raise PermissionError(f"guard.py {sub} 불가")
+        raise PermissionError(f"점검 모드에서는 이 스킬의 스크립트만 실행됩니다: {rest[0]}")
+    if prog in ("osv-scanner", "gitleaks"):
+        for a in args:
+            if pathlike(a) and not a.startswith("-"):
+                need(a, roots_r)
+        return None
+    if prog == "semgrep":
+        if "--metrics=off" not in args:
+            raise PermissionError("semgrep은 --metrics=off 로만")
+        for a in args:
+            if not a.startswith("-") and "/" in a and not a.startswith("p/"):
+                need(a, roots_r)
+        return None
+    raise PermissionError(f"점검 모드에서 허용되지 않은 명령: {prog}")
+
+
+def _find_vet_start(cmd):
+    """실제로 실행되는 guard.py 의 vet-start 명령만 (따옴표 안 글자·echo 문자열·입력 본문은 제외)."""
+    try:
+        w = [v for k, v in tokenize(cmd) if k == "w"]
+    except ValueError:
+        return None
+    for i in range(len(w) - 2):
+        if w[i].endswith("guard.py") and w[i + 1] == "vet-start":
+            return w[i + 2]
+    return None
+
+
+def cmd_vet_start(d):
+    rd = vet_valid_dir(d)
+    hit = [s for _, s in vet_states() if rd and s.get("dir") == rd and time.time() < s.get("expires", 0)]
+    if hit:
+        print(f"점검 모드 켜짐: {rd.replace(HOME, '~')} (최대 {time.strftime('%H:%M', time.localtime(hit[0]['expires']))}까지)")
+    else:
+        print("점검 모드가 켜지지 않았습니다. 감시 훅(PreToolUse)이 등록돼 있는지, 폴더가 임시 폴더 아래 vet-… 인지 확인하세요.")
+
+
+def cmd_vet_end(d, discard):
+    rd = vet_valid_dir(d)
+    if not rd:
+        sys.exit("중단: 임시 폴더 아래 vet-… 폴더만 지정할 수 있습니다.")
+    n = 0
+    for p, s in vet_states():
+        if s.get("dir") == rd:
+            os.remove(p)
+            n += 1
+    log(f"vet-mode 끔({'삭제' if discard else '보존'}): {rd.replace(HOME, '~')}")
+    if discard and os.path.isdir(rd):
+        import shutil
+        shutil.rmtree(rd)
+        print(f"점검 모드 끔 + 받은 코드 폴더 삭제: {rd}")
+    else:
+        print(f"점검 모드 끔 ({n}개 세션): {rd}")
+
+
+
 def pretool():
     try:
         data = json.load(sys.stdin)
@@ -131,6 +655,9 @@ def pretool():
         return
     tool = data.get("tool_name", "")
     ti = data.get("tool_input") or {}
+    sid = data.get("session_id") or "nosession"
+    cwd = data.get("cwd") or os.getcwd()
+    vet = vet_load(sid)
 
     # 오토 모드에서도 끊기지 않게: 승인창(ask)은 기준선 변경 하나만 남기고,
     # 확실한 악성은 자동 차단(deny), 나머지는 기록만(note) — 스킬·설정 변경은 SessionStart 무결성 검사가 다시 잡는다.
@@ -150,8 +677,10 @@ def pretool():
         rp = os.path.realpath(os.path.expanduser(p))
         if rp in EXEMPT_WRITE:
             return
-        cwd = data.get("cwd") or os.getcwd()
         full = rp if os.path.isabs(p) else os.path.realpath(os.path.join(cwd, p))
+        if vet and not inside(full, vet["dir"]):
+            decide("deny", f"[점검 모드] 외부 코드 점검 중에는 점검 폴더({vet['dir']}) 밖에 파일을 쓸 수 없습니다. "
+                           "점검이 끝난 뒤(설치 또는 `guard.py vet-end <폴더> --discard`) 진행하세요.")
         if PROT_PATH.search(full.replace(HOME, "~")) or PROT_PATH.search(full):
             note(f"스킬·플러그인·훅·MCP 설정 파일 수정: {full.replace(HOME, '~')}")
         return
@@ -160,7 +689,9 @@ def pretool():
         return
     cmd = ti.get("command") or ""
 
-    touches = bool(PROT_PATH.search(cmd))
+    # 이 스킬 자신의 스크립트 경로(guard.py·scan.py·install_verified.py)를 부르는 것은 스킬 폴더를 '건드리는' 것으로 보지 않음
+    own = re.compile(r"(~|\$HOME|\$\{HOME\}|" + re.escape(HOME) + r")/\.claude/skills/skill-security-vetting/(hooks/guard|scripts/(scan|install_verified))\.py")
+    touches = bool(PROT_PATH.search(own.sub("<이-스킬-스크립트>", cmd)))
     # 실제로 실행되는 부분만: heredoc 본문·따옴표 안 문자열을 걷어낸 명령
     bare = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?.*?\n.*?\n\1\b", "<<HEREDOC", cmd, flags=re.S)
     bare = re.sub(r"'[^']*'|\"(\\.|[^\"\\])*\"", "''", bare)
@@ -171,9 +702,33 @@ def pretool():
         return m.group(0) if re.search(r"\b(ba|z|da)?sh\s*(-s\s*)?$", before.strip()) else "<<HEREDOC"
     nohd = re.sub(r"<<-?\s*['\"]?(\w+)['\"]?.*?\n.*?\n\1\b", _strip_data_heredoc, cmd, flags=re.S)
 
-    # 1) 승인창: 감시 기준선 변경만 (악성 스킬이 Claude를 속여 스스로 승인하는 것 방지, 드물게만 뜸)
+    # 0) 점검 모드 켜기: vet-start 명령, 또는 임시 폴더의 vet-… 폴더로 받기 시작하면 자동으로 (이 세션만)
+    if not vet:
+        m = _find_vet_start(nohd)
+        cand = m
+        if not cand and FETCH_VERB.search(bare):
+            m2 = VET_PATH.search(cmd)
+            cand = m2.group(1) if m2 else None
+        if cand:
+            rd = vet_valid_dir(cand)
+            if rd:
+                vet = vet_start(sid, rd)
+            elif m:
+                decide("deny", "점검 폴더는 임시 폴더 아래 `vet-…` 이름이어야 합니다 (mktemp -d \"${TMPDIR:-/tmp}/vet-REPO-XXXXXX\").")
+
+    # 1) 승인창: 감시 기준선 변경 + 외부 스킬 설치(설치하면서 기준선에 자동 등록되므로) — 둘 다 드물게만 뜸
     if BASELINE_CHANGE.search(cmd):
         decide("ask", "감시 기준선 변경입니다. 바뀐 스킬·설정을 확인하셨다면 승인하세요.")
+    if re.search(r"python3?\b[^|;&\n]*install_verified\.py", cmd):
+        if vet:
+            r = None
+            try:
+                r = vet_check(cmd, cwd, vet["dir"])
+            except Exception as e:
+                r = ("deny", f"판단 중 오류: {e}")
+            if r:
+                decide("deny", "[점검 모드] " + r[1])
+        decide("ask", "점검한 외부 스킬을 설치하고 감시 기준선에 등록합니다. 점검 결과를 보고 설치하기로 하셨다면 승인하세요.")
     # 2) 자동 차단: 확실한 악성
     if touches and FETCH_VERB.search(bare):
         decide("deny", "외부 코드를 스킬·플러그인·설정 폴더에 직접 받으려고 합니다. 격리 폴더에 받기 → 점검 → install_verified.py 절차로 진행하세요.")
@@ -188,6 +743,20 @@ def pretool():
             hit = rx.search(nohd)
         if hit:
             decide("deny", f"위험한 명령이라 막았습니다: {desc}")
+    # 2-1) 점검 모드: 허용 목록에 있는 명령만 (오토 모드와 상관없이)
+    if vet:
+        try:
+            r = vet_check(cmd, cwd, vet["dir"])
+        except Exception as e:
+            r = ("deny", f"판단 중 오류: {e}")
+        if r:
+            kind, why = r
+            msg = f"[점검 모드] {why}"
+            if kind == "deny":
+                msg += (" — 외부 코드를 점검하는 동안에는 읽기·점검 명령만 실행됩니다. "
+                        "점검이 끝나면 설치(install_verified.py) 또는 `guard.py vet-end <폴더> --discard`로 끄세요"
+                        f" (자동으로 꺼지는 시각 {time.strftime('%H:%M', time.localtime(vet['expires']))})")
+            decide(kind, msg)
     # 3) 기록만: 스킬·설정 폴더 쓰기, 설치, 자동 실행 등록 등 (다음 세션 시작 때 무결성 검사가 확인)
     if touches and (WRITE_VERB.search(cmd) or "install_verified.py" in cmd or FETCH_VERB.search(cmd)):
         note("스킬·플러그인·훅·MCP 설정 폴더를 바꾸는 명령")
@@ -455,5 +1024,9 @@ if __name__ == "__main__":
         cmd_accept(a[1:], os.getcwd())
     elif a[0] == "status":
         cmd_status(os.getcwd())
+    elif a[0] == "vet-start" and len(a) >= 2:
+        cmd_vet_start(a[1])
+    elif a[0] == "vet-end" and len(a) >= 2:
+        cmd_vet_end(a[1], "--discard" in a[2:])
     else:
         print(__doc__)
